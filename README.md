@@ -249,3 +249,7 @@ ln -s ~/coding/apps/shepherd/bin/shepherd ~/.local/bin/shepherd
 
 Needs Python 3.11+ (for `tomllib`) and Herdr. The `sf` team also needs the vibe-force
 checkout at `~/coding/apps/vibe-force`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
