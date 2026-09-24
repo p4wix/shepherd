@@ -1,0 +1,10 @@
+description = "Ship a feature: lead plans and integrates, helper builds, Codex reviews"
+
+[[agents]]
+role = "lead"
+
+[[agents]]
+role = "reviewer"
+
+[[agents]]
+role = "helper"

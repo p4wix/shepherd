@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""shepherd - open a Herdr workspace with a team of coding agents.
+
+Usage:
+  shepherd [dir] [label] [--team NAME] [--stack NAME]... [--no-focus] [--dry-run]
+  shepherd list
+
+Teams, roles and stacks live in this repo (teams/, roles/, stacks/). A project can
+pick its defaults in <dir>/.shepherd.toml and override any file in <dir>/.shepherd/.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CACHE = Path.home() / ".cache" / "shepherd"
+NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # Herdr agent-name rule
+NONE_IN_TEAM = "(none in this team)"
+
+# How each agent kind receives its instructions. Herdr refuses multi-line
+# arguments, so Claude reads a file and Codex gets a one-line TOML string.
+KINDS = {
+    "claude": lambda path, text: ["--append-system-prompt-file", str(path)],
+    "codex": lambda path, text: ["-c", "developer_instructions=" + json.dumps(text, ensure_ascii=False)],
+}
+
+
+def die(msg):
+    sys.exit(f"shepherd: {msg}")
+
+
+def search_paths(project):
+    return [project / ".shepherd", ROOT] if project else [ROOT]
+
+
+def find(project, rel):
+    for base in search_paths(project):
+        p = base / rel
+        if p.is_file():
+            return p
+    return None
+
+
+def load_doc(project, rel):
+    """Markdown with optional TOML front matter between +++ lines -> (meta, body)."""
+    p = find(project, rel)
+    if not p:
+        die(f"missing {rel} (looked in {', '.join(str(b) for b in search_paths(project))})")
+    text = p.read_text(encoding="utf-8")
+    if text.startswith("+++\n"):
+        head, _, body = text[4:].partition("\n+++\n")
+        return tomllib.loads(head), body.strip()
+    return {}, text.strip()
+
+
+def load_team(project, name):
+    p = find(project, f"teams/{name}.toml")
+    if not p:
+        die(f"unknown team '{name}' (see: shepherd list)")
+    return tomllib.loads(p.read_text(encoding="utf-8"))
+
+
+def names_in(project, kind):
+    seen = {}
+    for base in reversed(search_paths(project)):
+        for p in sorted((base / kind).glob("*.*")):
+            seen[p.stem] = p
+    return seen
+
+
+def expand(arg):
+    """`~` and {{root}} (this repo) in extra agent arguments, also in `--flag=value`."""
+    flag, eq, value = arg.partition("=") if arg.startswith("-") else ("", "", arg)
+    if value.startswith(("~", "{{root}}")):
+        value = str(Path(value.replace("{{root}}", str(ROOT))).expanduser())
+    return flag + eq + value
+
+
+def render_settings(arg, out):
+    """A settings file that uses {{root}} is passed as a rendered copy in the cache."""
+    flag, eq, value = arg.partition("=") if arg.startswith("-") else ("", "", arg)
+    p = Path(value)
+    if p.suffix == ".json" and p.is_file():
+        text = p.read_text(encoding="utf-8")
+        if "{{root}}" in text:
+            dst = out / p.name
+            dst.write_text(text.replace("{{root}}", str(ROOT)), encoding="utf-8")
+            value = str(dst)
+    return flag + eq + value
+
+
+def detect_stacks(project):
+    """Stacks whose `detect` rules match the project: "file" exists, or
+    "package.json:dep" lists dep in dependencies or devDependencies."""
+    found = []
+    for name in names_in(project, "stacks"):
+        meta, _ = load_doc(project, f"stacks/{name}.md")
+        for rule in meta.get("detect", []):
+            file, _, dep = rule.partition(":")
+            p = project / file
+            if not p.is_file():
+                continue
+            if not dep:
+                found.append(name)
+                break
+            try:
+                pkg = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(pkg, dict):
+                continue
+            deps = [pkg.get(k) for k in ("dependencies", "devDependencies")]
+            if any(isinstance(d, dict) and dep in d for d in deps):
+                found.append(name)
+                break
+    return found
+
+
+def slug(text):
+    s = re.sub(r"[^a-z0-9_-]", "-", text.lower())
+    return re.sub(r"^[^a-z]*", "", s)
+
+
+def herdr(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    try:
+        data = json.loads(r.stdout or r.stderr)
+    except json.JSONDecodeError:
+        data = {"error": {"code": "bad_output", "message": (r.stdout + r.stderr).strip()}}
+    return data
+
+
+def herdr_ok(*args):
+    data = herdr(*args)
+    if "error" in data:
+        die(f"herdr {' '.join(args[:2])}: {data['error'].get('message')}")
+    return data["result"]
+
+
+def build_agents(project, team, label):
+    agents = []
+    for spec in team.get("agents", []):
+        role = spec["role"]
+        meta, body = load_doc(project, f"roles/{role}.md")
+        count = int(spec.get("count", 1))
+        for i in range(1, count + 1):
+            suffix = spec.get("name") if count == 1 and spec.get("name") else role
+            if count > 1:
+                suffix = f"{suffix}-{i}"
+            agents.append({
+                "role": role,
+                "suffix": suffix,
+                "kind": spec.get("kind", meta.get("kind", "claude")),
+                "args": [expand(x) for x in spec.get("args", [])],
+                "description": meta.get("description", ""),
+                "skills": meta.get("skills", {}),
+                "body": body,
+            })
+    if not agents:
+        die("the team has no agents")
+    # Agent names must be unique per Herdr server, so they get a label prefix.
+    room = 32 - 1 - max(len(a["suffix"]) for a in agents)
+    prefix = slug(label)[:room].rstrip("-_") or "ws"
+    for a in agents:
+        a["name"] = f"{prefix}-{a['suffix']}"
+        if not NAME_RE.match(a["name"]):
+            die(f"invalid agent name '{a['name']}'")
+        if a["kind"] not in KINDS:
+            die(f"agent kind '{a['kind']}' is not supported (known: {', '.join(KINDS)})")
+    if len({a["name"] for a in agents}) != len(agents):
+        die("two agents in the team get the same name; set 'name' in the team file")
+    return prefix, agents
+
+
+def skill_lines(skills):
+    return [f"- `{k}`: {v}" if v else f"- `{k}`" for k, v in skills.items()]
+
+
+def render(project, agent, agents, label, directory, stacks, context):
+    roster = ["| Agent | Tool | Role |", "|---|---|---|"]
+    roster += [f"| {a['name']} | {a['kind']} | {a['role']}: {a['description']} |" for a in agents]
+    by_role = {}
+    for a in agents:
+        by_role.setdefault(a["role"], []).append(a["name"])
+    values = {
+        "self": agent["name"], "label": label, "dir": str(directory),
+        "roster": "\n".join(roster),
+        **{role: ", ".join(names) for role, names in by_role.items()},
+    }
+
+    _, team_md = load_doc(project, "team.md")
+    parts = [team_md, f"## Your role: {agent['role']} ({agent['name']})\n\n{agent['body']}"]
+
+    skills = skill_lines(agent["skills"])
+    stack_parts = []
+    for s in stacks:
+        meta, body = load_doc(project, f"stacks/{s}.md")
+        stack_parts.append(f"## Project stack: {s}\n\n{body}")
+        skills += skill_lines(meta.get("skills", {}))
+    if skills:
+        parts.append("## Your skills\n\nLoad the matching skill before you start work it covers.\n\n"
+                     + "\n".join(dict.fromkeys(skills)))
+    parts += stack_parts
+    if context:
+        parts.append(f"## Project context\n\n{context.strip()}")
+
+    text = "\n\n".join(parts)
+    text = re.sub(r"\{\{(\w[\w-]*)\}\}", lambda m: values.get(m.group(1), NONE_IN_TEAM), text)
+    return text + "\n"
+
+
+def cmd_list():
+    project = Path.cwd()
+    print("Teams:")
+    for name, p in names_in(project, "teams").items():
+        team = tomllib.loads(p.read_text(encoding="utf-8"))
+        members = ", ".join(
+            a["role"] + (f" x{a['count']}" if a.get("count", 1) > 1 else "") for a in team.get("agents", []))
+        print(f"  {name:<14} {team.get('description', '')}  [{members}]")
+    for kind in ("roles", "stacks"):
+        print(f"\n{kind.capitalize()}:")
+        for name in names_in(project, kind):
+            meta, _ = load_doc(project, f"{kind}/{name}.md")
+            extra = f" ({meta['kind']})" if kind == "roles" and "kind" in meta else ""
+            if kind == "stacks" and meta.get("detect"):
+                extra = f"  [detect: {', '.join(meta['detect'])}; team: {meta.get('team', 'feature')}]"
+            print(f"  {name:<14} {meta.get('description', '')}{extra}")
+
+
+def layout(root_pane, count, directory):
+    """First agent on the left, the rest stacked evenly on the right."""
+    panes = [root_pane]
+    if count == 1:
+        return panes
+    right = herdr_ok("pane", "split", root_pane, "--direction", "right", "--cwd", str(directory),
+                     "--no-focus")["pane"]["pane_id"]
+    panes.append(right)
+    rest = count - 1
+    for i in range(rest - 1):
+        # The split pane keeps `ratio` of its space, so 1/remaining gives equal rows.
+        new = herdr_ok("pane", "split", panes[-1], "--direction", "down", "--ratio",
+                       f"{1 / (rest - i):.4f}", "--cwd", str(directory), "--no-focus")["pane"]["pane_id"]
+        panes.append(new)
+    return panes
+
+
+def cmd_up(args):
+    directory = Path(args.dir).expanduser().resolve()
+    if not directory.is_dir():
+        die(f"not a directory: {directory}")
+    cfg_path = directory / ".shepherd.toml"
+    cfg = tomllib.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+
+    label = args.label or cfg.get("label") or directory.name
+    stacks = args.stack or cfg.get("stacks")
+    detected = stacks is None
+    if detected:
+        stacks = detect_stacks(directory)
+    # Team: flag, then project config, then the first stack that names one, then "feature".
+    team_name = args.team or cfg.get("team")
+    for s in stacks:  # also validates every stack before anything is written
+        stack_team = load_doc(directory, f"stacks/{s}.md")[0].get("team")
+        team_name = team_name or stack_team
+    team_name = team_name or "feature"
+    team = load_team(directory, team_name)
+    prefix, agents = build_agents(directory, team, label)
+
+    out = CACHE / prefix
+    out.mkdir(parents=True, exist_ok=True)
+    for a in agents:
+        a["args"] = [render_settings(x, out) for x in a["args"]]
+        a["prompt"] = out / f"{a['suffix']}.md"
+        a["text"] = render(directory, a, agents, label, directory, stacks, cfg.get("context", ""))
+        a["prompt"].write_text(a["text"], encoding="utf-8")
+
+    stack_note = (", ".join(stacks) or "none") + (" (detected)" if detected and stacks else "")
+    print(f"Team '{team_name}' in {directory} (workspace '{label}', stacks: {stack_note})")
+    for a in agents:
+        print(f"  {a['name']:<24} {a['kind']:<7} {a['prompt']}")
+    if args.dry_run:
+        return
+
+    taken = {a.get("name") for a in herdr_ok("agent", "list")["agents"]}
+    clash = [a["name"] for a in agents if a["name"] in taken]
+    if clash:
+        die(f"agent names already in use: {', '.join(clash)}; pick another label, e.g. shepherd {args.dir} {label}2")
+
+    ws = herdr_ok("workspace", "create", "--cwd", str(directory), "--label", label,
+                  "--no-focus" if args.no_focus else "--focus")
+    panes = layout(ws["root_pane"]["pane_id"], len(agents), directory)
+    time.sleep(1)  # give the shells time to show their prompt
+
+    def start(pair):
+        a, pane = pair
+        extra = KINDS[a["kind"]](a["prompt"], a["text"].strip()) + a["args"]
+        return a, herdr("agent", "start", a["name"], "--kind", a["kind"], "--pane", pane, "--", *extra)
+
+    failed = False
+    with ThreadPoolExecutor() as pool:
+        for a, res in pool.map(start, zip(agents, panes)):
+            err = res.get("error")
+            if not err:
+                continue
+            # agent_not_ready: running but waiting at a startup prompt (e.g. "trust
+            # this folder?"), which only the user should answer.
+            if err.get("code") == "agent_not_ready":
+                print(f"  {a['name']} is waiting for your confirmation in its pane", file=sys.stderr)
+            else:
+                print(f"  {a['name']} failed to start: {err.get('message')}", file=sys.stderr)
+                failed = True
+    sys.exit(1 if failed else 0)
+
+
+def main():
+    if sys.argv[1:2] == ["list"]:
+        return cmd_list()
+    p = argparse.ArgumentParser(prog="shepherd", description=__doc__.split("\n\n")[0])
+    p.add_argument("dir", nargs="?", default=".", help="project directory (default: current)")
+    p.add_argument("label", nargs="?", help="workspace name and agent-name prefix (default: folder name)")
+    p.add_argument("--team", help="team from teams/ (default: .shepherd.toml or 'feature')")
+    p.add_argument("--stack", action="append", help="stack from stacks/, repeatable")
+    p.add_argument("--no-focus", action="store_true", help="do not switch to the new workspace")
+    p.add_argument("--dry-run", action="store_true", help="only render the prompts and show the plan")
+    cmd_up(p.parse_args())
+
+
+if __name__ == "__main__":
+    main()

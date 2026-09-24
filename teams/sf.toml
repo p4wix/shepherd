@@ -1,0 +1,10 @@
+description = "Salesforce: one Claude agent working through the vibe-force plugin"
+
+# vibe-force and the production guard are loaded for this agent only, so a plain
+# `claude` in the same project keeps its usual setup.
+[[agents]]
+role = "sf"
+args = [
+  "--plugin-dir", "~/coding/apps/vibe-force",
+  "--settings", "{{root}}/settings/salesforce.json",
+]

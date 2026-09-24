@@ -1,0 +1,7 @@
+description = "Small changes: lead does the work, Codex reviews"
+
+[[agents]]
+role = "lead"
+
+[[agents]]
+role = "reviewer"

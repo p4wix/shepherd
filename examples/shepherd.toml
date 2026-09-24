@@ -1,0 +1,15 @@
+# Copy to <project>/.shepherd.toml. Every key is optional.
+
+# Team from teams/ (default: "feature").
+team = "feature"
+
+# Stacks from stacks/ whose rules and skills every agent gets.
+stacks = ["web"]
+
+# Workspace name and agent-name prefix (default: the folder name).
+# label = "myapp"
+
+# Anything every agent should know about this project.
+context = """
+Run tests with `npm test`. The staging database is shared; never reset it.
+"""
