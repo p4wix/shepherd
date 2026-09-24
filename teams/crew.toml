@@ -1,0 +1,14 @@
+description = "Default: lead orchestrates two Claude and two Codex workers, roles assigned per task"
+
+[[agents]]
+role = "lead"
+
+[[agents]]
+role = "worker"
+kind = "claude"
+count = 2
+
+[[agents]]
+role = "worker"
+kind = "codex"
+count = 2

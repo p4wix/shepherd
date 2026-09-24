@@ -1,0 +1,8 @@
+description = "Small changes: lead does most of the work, one Codex worker reviews and checks"
+
+[[agents]]
+role = "lead"
+
+[[agents]]
+role = "worker"
+kind = "codex"

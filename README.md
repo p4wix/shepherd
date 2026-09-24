@@ -3,31 +3,79 @@
 ![Shepherd guiding a team of coding agents across a terminal workspace](assets/shepherd-banner.png)
 
 Opens a [Herdr](https://herdr.dev) workspace with a team of coding agents (Claude Code,
-Codex) that know from the first second who is who, what their role is and which skills
-to use. Teams, roles and stacks are plain files, so growing the team means adding a file.
+Codex): one lead that orchestrates and generic workers that take whatever role the lead
+gives them for each task. Every agent knows from the first second who is who and which
+skills to use. Teams, roles, playbooks and stacks are plain files, so growing the team
+means adding a file.
 
 ```
 ┌──────────────┬──────────────┐
-│              │ app-reviewer │
+│              │ app-worker-1 │
+│              ├──────────────┤
+│              │ app-worker-2 │
 │   app-lead   ├──────────────┤
-│              │ app-helper   │
+│              │ app-worker-3 │
+│              ├──────────────┤
+│              │ app-worker-4 │
 └──────────────┴──────────────┘
 ```
 
 ## Usage
 
 ```
-shepherd                            # team in the current folder
+shepherd                            # default team (crew) in the current folder
 shepherd ~/coding/app               # team in another folder
-shepherd ~/coding/app api           # custom label: api-lead, api-reviewer, ...
-shepherd --team squad --stack web   # pick a team and stacks
+shepherd ~/coding/app api           # custom label: api-lead, api-worker-1, ...
+shepherd --team pair --stack web    # pick a team and stacks
 shepherd --dry-run                  # render prompts and show the plan, open nothing
-shepherd list                       # teams, roles and stacks available here
+shepherd list                       # teams, roles, playbooks and stacks available here
 ```
 
-You talk to the lead. The lead plans, delegates to helpers over Herdr, sends the diff
-to the reviewer and reports back. Look into the other panes when you want to follow
-along, or when an agent is `blocked` on a permission prompt only you should answer.
+| Team | Agents |
+|---|---|
+| `crew` (default) | lead + `worker-1`, `worker-2` (Claude Code) + `worker-3`, `worker-4` (Codex) |
+| `pair` | lead + one Codex `worker`, for small changes |
+| `sf` | one Claude agent working through vibe-force (below) |
+
+You talk to the lead. The lead agrees on the goal with you, plans the work, gives each
+worker a task with a role and a playbook, runs independent tasks in parallel, checks
+what comes back, has the change reviewed by a worker of the other tool and reports to
+you. Look into the other panes when you want to follow along, or when an agent is
+`blocked` on a permission prompt only you should answer.
+
+## Workers and playbooks
+
+Workers have no fixed role. For each task the lead names a role and the playbook that
+describes it ("Your role for this task: tester. Read <path>/playbooks/tester.md
+first."); the worker reads that file and follows it for that task only.
+
+| Playbook | Suits | What it is for |
+|---|---|---|
+| `implementer` | claude | implements one piece of a feature and proves it works |
+| `tester` | claude | writes and runs tests, reports bugs without fixing them |
+| `reviewer` | codex, claude | reviews a change for defects, does not write code |
+| `researcher` | claude, codex | answers one question from code, docs or the web, with sources |
+| `debugger` | claude, codex | finds the root cause of a failure and fixes it or reports it |
+| `planner` | claude, codex | turns a goal into pieces the lead can delegate |
+| `documenter` | claude | writes or updates documentation |
+
+A playbook is `playbooks/<name>.md`: front matter (`description`, `kinds` as a hint for
+the lead, optional `[skills]`) + instructions, including the report the lead expects.
+The lead's prompt lists all playbooks with their absolute paths. A project can override
+one or add its own in `<project>/.shepherd/playbooks/`.
+
+The lead runs Claude Code with this repo's plugin (`plugin/`), loaded through
+`args = ["--plugin-dir", "{{root}}/plugin"]` in `roles/lead.md`. It brings:
+
+| Skill | Use |
+|---|---|
+| `shepherd:orchestrate` | the full loop from request to report |
+| `shepherd:dispatch` | sending a task to a worker, waiting, reading the result |
+| `shepherd:worktrees` | parallel code changes, one git worktree per task |
+| `shepherd:review-loop` | getting a change reviewed and triaging the findings |
+
+The lead keeps a task board (task, worker, role, state, result) in
+`~/.cache/shepherd/<prefix>/board.md`.
 
 ## Stack and team detection
 
@@ -49,7 +97,7 @@ team = "sf"                                            # optional default team
 | Setting | Precedence (first one set wins) |
 |---|---|
 | Stacks | `--stack`, then `.shepherd.toml` `stacks` (`stacks = []` turns detection off), then detection |
-| Team | `--team`, then `.shepherd.toml` `team`, then the first stack that names a `team`, then `feature` |
+| Team | `--team`, then `.shepherd.toml` `team`, then the first stack that names a `team`, then `crew` |
 
 The plan line says which stacks were detected, e.g.
 `Team 'sf' in /path/to/crm (workspace 'crm', stacks: salesforce (detected))`.
@@ -68,7 +116,7 @@ parallel work. `teams/sf.toml` starts it with:
 | `--settings {{root}}/settings/salesforce.json` | the production guard hook (below) |
 
 Both are loaded for that agent only, so a plain `claude` in the same project keeps its
-usual setup. `shepherd --team duo` (or any other team) still works in a Salesforce
+usual setup. `shepherd --team pair` (or any other team) still works in a Salesforce
 project; those teams get the stack rules but not vibe-force or the guard.
 
 The vibe-force checkout stays at `11963f7` on purpose: the guard's rules for the
@@ -164,56 +212,89 @@ hook allows.
 | Piece | File | What it is |
 |---|---|---|
 | Shared rules | `team.md` | Rules every agent gets, plus the generated roster table |
-| Role | `roles/<role>.md` | One job: front matter (`kind`, `description`, `skills`) + instructions |
-| Team | `teams/<team>.toml` | Which roles to open, in what order, how many of each, extra CLI args |
+| Role | `roles/<role>.md` | A fixed session role (`lead`, `worker`, `sf`): front matter (`kind`, `description`, `args`, `skills`) + instructions |
+| Playbook | `playbooks/<name>.md` | A per-task role the lead assigns to a worker: front matter (`description`, `kinds`, `skills`) + instructions |
+| Team | `teams/<team>.toml` | Which roles to open, in what order, how many of each, their tool, extra CLI args and skills |
+| Plugin | `plugin/` | Claude Code plugin with the lead's `shepherd:*` skills |
 | Stack | `stacks/<stack>.md` | Technology rules and skills for a kind of project; `detect` and `team` for auto-detection |
 | Claude settings | `settings/<name>.json` | Extra settings passed with `--settings` by a team (e.g. hooks) |
 | Hooks | `hooks/prod-guard.py` | The production guard for the `sf` team |
-| Tests | `tests/` | Tests for the hooks (`python3 -m unittest discover -s tests -v`) |
-| Project config | `<project>/.shepherd.toml` | Default team, stacks, label and free-text context |
+| Tests | `tests/` | Tests for the hooks and for `bin/shepherd` (`test_shepherd.py`); `python3 -m unittest discover -s tests -v` |
+| Project config | `<project>/.shepherd.toml` | Default team, stacks, label, free-text context and skills for everyone (see `examples/shepherd.toml`) |
 | Project overrides | `<project>/.shepherd/` | Same layout as this repo; a file here wins for that project |
 
 Each agent's prompt is `team.md` + its role + its skills + the stacks + the project
-context, rendered to `~/.cache/shepherd/<label>/<agent>.md`. Claude gets it through
+context, rendered to `~/.cache/shepherd/<prefix>/<agent>.md`. Claude gets it through
 `--append-system-prompt-file`, Codex through `-c developer_instructions=...`. It is
 added to the agent's own setup (CLAUDE.md, AGENTS.md, memory), not a replacement.
 
-Placeholders in `team.md`, roles and stacks: `{{self}}`, `{{label}}`, `{{dir}}`,
-`{{roster}}` and `{{<role>}}` (names of the agents with that role, comma-separated, or
-"(none in this team)").
+Placeholders in `team.md`, roles and stacks (the project context is left as written):
+
+| Placeholder | Becomes |
+|---|---|
+| `{{self}}`, `{{label}}`, `{{dir}}` | the agent's name, the workspace label, the project folder |
+| `{{root}}` | this repo's path |
+| `{{cache}}` | `~/.cache/shepherd/<prefix>`, where prompts and the lead's board live; `<prefix>` is the label in lowercase, with characters other than letters, digits, `-` and `_` turned into `-`, shortened to fit agent names |
+| `{{roster}}` | the table of agents with tool and role |
+| `{{playbooks}}` | the table of playbooks with kinds, description and absolute path |
+| `{{<role>}}` | names of the agents with that role, comma-separated, e.g. `{{worker}}` |
+
+Any other placeholder, e.g. a role not in the team, becomes "(none in this team)".
 
 The first agent in a team opens on the left, the rest are stacked evenly on the right.
 
 ## Extending
 
-**New role:** add `roles/tester.md`:
+**New playbook:** most new jobs are a playbook, not a role. Add
+`playbooks/auditor.md` (or `<project>/.shepherd/playbooks/auditor.md` for one project):
 
 ```markdown
 +++
-kind = "claude"            # or "codex"
-description = "writes and runs end-to-end tests"
+description = "checks a change against the project's accessibility rules"
+kinds = ["claude"]         # which tools suit it: a hint for the lead
 
 [skills]
-"run" = "starting the app for a test run"
+"run" = "the page has to be opened to check it"
 +++
-You write end-to-end tests for what {{lead}} asks for...
+You audit the change the lead points you at...
+
+Report for the lead:
+- **Findings:** ...
 ```
 
-then add it to a team:
+The lead sees it in its playbook table on the next start and can assign it to any
+worker.
+
+**New role:** only for an agent with a fixed job for the whole session (like `lead`
+or `sf`). Add `roles/<role>.md` with front matter (`kind`, `description`, optional
+`args` and `[skills]`) and instructions, then add it to a team:
 
 ```toml
 [[agents]]
-role = "tester"
+role = "<role>"
 ```
 
-**More of one role:** `count = 2` gives `<label>-helper-1` and `<label>-helper-2`.
-**Custom agent name:** `name = "qa"` gives `<label>-qa`.
-**Extra CLI flags for one agent:** `args = ["--model", "opus"]`. A leading `~` and
-`{{root}}` (this repo) are expanded in each argument, also in `--flag=value` form:
-`args = ["--settings={{root}}/settings/salesforce.json"]`.
+**More of one role:** `count = 2` gives `<prefix>-worker-1` and `<prefix>-worker-2`.
+Entries with the same base name are numbered together, so two `worker` entries with
+`count = 2` each (one `kind = "claude"`, one `kind = "codex"`) give `worker-1` to
+`worker-4`. A single agent keeps the plain name (`<prefix>-worker`).
+**Custom agent name:** `name = "qa"` gives `<prefix>-qa`.
+**Extra CLI flags:** `args = ["--model", "opus"]` in a team entry; a role's own `args`
+come first. A leading `~` and `{{root}}` (this repo) are expanded in each argument, also
+in `--flag=value` form: `args = ["--settings={{root}}/settings/salesforce.json"]`.
 
-**New skill:** add a line under `[skills]` in a role (only that role gets it) or in a
-stack (everyone in projects with that stack gets it). The line says when to use it.
+**New skill:** add a line that says when to use it, in one of:
+
+| Where | Who gets it |
+|---|---|
+| a role's `[skills]` | every agent with that role |
+| a playbook's `[skills]` | the worker playing it, if its tool has the skill |
+| a team entry's `skills` table | that team entry's agents only |
+| a stack's `[skills]` | everyone in projects with that stack |
+| `.shepherd.toml` `[skills]` | everyone in that project |
+
+The skill itself is either installed globally (listed by name, e.g. `engineering:debug`)
+or added to the lead's plugin as `plugin/skills/<name>/SKILL.md` (then `shepherd:<name>`).
 
 **New stack:** add `stacks/<name>.md`, then either list it in a project's
 `.shepherd.toml` or give it `detect` rules (and optionally a `team`) so matching
@@ -222,7 +303,7 @@ projects get it automatically.
 **Hooks or settings for one team:** put a settings file in `settings/` and pass it with
 `args = ["--settings", "{{root}}/settings/<name>.json"]`. `{{root}}` inside a settings
 file (e.g. the hook command) is replaced with this repo's path in a rendered copy under
-`~/.cache/shepherd/<label>/`, so the repo can live anywhere.
+`~/.cache/shepherd/<prefix>/`, so the repo can live anywhere.
 
 **New agent tool** (e.g. Gemini): add an entry to `KINDS` in `bin/shepherd` that says
 how that CLI receives extra instructions.

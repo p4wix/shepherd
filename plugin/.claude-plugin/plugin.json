@@ -1,0 +1,5 @@
+{
+  "name": "shepherd",
+  "version": "0.2.0",
+  "description": "Orchestration skills for the shepherd lead: plan, dispatch to Herdr workers, parallel worktrees, review loop."
+}

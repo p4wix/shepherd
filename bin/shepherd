@@ -5,7 +5,7 @@ Usage:
   shepherd [dir] [label] [--team NAME] [--stack NAME]... [--no-focus] [--dry-run]
   shepherd list
 
-Teams, roles and stacks live in this repo (teams/, roles/, stacks/). A project can
+Teams, roles, playbooks and stacks live in this repo (teams/, roles/, playbooks/, stacks/). A project can
 pick its defaults in <dir>/.shepherd.toml and override any file in <dir>/.shepherd/.
 """
 import argparse
@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CACHE = Path.home() / ".cache" / "shepherd"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # Herdr agent-name rule
 NONE_IN_TEAM = "(none in this team)"
+DEFAULT_TEAM = "crew"
 
 # How each agent kind receives its instructions. Herdr refuses multi-line
 # arguments, so Claude reads a file and Codex gets a one-line TOML string.
@@ -144,22 +145,29 @@ def herdr_ok(*args):
 
 
 def build_agents(project, team, label):
+    specs = team.get("agents", [])
+    # Entries with the same base name are numbered together, so two entries of
+    # workers (e.g. claude and codex) give worker-1..worker-4, not two worker-1.
+    totals = {}
+    for spec in specs:
+        base = spec.get("name") or spec["role"]
+        totals[base] = totals.get(base, 0) + int(spec.get("count", 1))
+    seen = {}
     agents = []
-    for spec in team.get("agents", []):
+    for spec in specs:
         role = spec["role"]
         meta, body = load_doc(project, f"roles/{role}.md")
-        count = int(spec.get("count", 1))
-        for i in range(1, count + 1):
-            suffix = spec.get("name") if count == 1 and spec.get("name") else role
-            if count > 1:
-                suffix = f"{suffix}-{i}"
+        base = spec.get("name") or role
+        for _ in range(int(spec.get("count", 1))):
+            seen[base] = seen.get(base, 0) + 1
+            suffix = f"{base}-{seen[base]}" if totals[base] > 1 else base
             agents.append({
                 "role": role,
                 "suffix": suffix,
                 "kind": spec.get("kind", meta.get("kind", "claude")),
-                "args": [expand(x) for x in spec.get("args", [])],
+                "args": [expand(x) for x in meta.get("args", []) + spec.get("args", [])],
                 "description": meta.get("description", ""),
-                "skills": meta.get("skills", {}),
+                "skills": {**meta.get("skills", {}), **spec.get("skills", {})},
                 "body": body,
             })
     if not agents:
@@ -178,26 +186,36 @@ def build_agents(project, team, label):
     return prefix, agents
 
 
+def playbook_table(project):
+    """Playbooks the lead can assign, with the path a worker should read."""
+    rows = ["| Playbook | Suits | What it is for | File |", "|---|---|---|---|"]
+    for name in names_in(project, "playbooks"):
+        meta, _ = load_doc(project, f"playbooks/{name}.md")
+        kinds = ", ".join(meta.get("kinds", [])) or "any"
+        rows.append(f"| {name} | {kinds} | {meta.get('description', '')} | {find(project, f'playbooks/{name}.md')} |")
+    return "\n".join(rows) if len(rows) > 2 else "(no playbooks)"
+
+
 def skill_lines(skills):
     return [f"- `{k}`: {v}" if v else f"- `{k}`" for k, v in skills.items()]
 
 
-def render(project, agent, agents, label, directory, stacks, context):
+def render(project, agent, agents, label, directory, stacks, cfg, out):
     roster = ["| Agent | Tool | Role |", "|---|---|---|"]
     roster += [f"| {a['name']} | {a['kind']} | {a['role']}: {a['description']} |" for a in agents]
     by_role = {}
     for a in agents:
         by_role.setdefault(a["role"], []).append(a["name"])
     values = {
-        "self": agent["name"], "label": label, "dir": str(directory),
-        "roster": "\n".join(roster),
+        "self": agent["name"], "label": label, "dir": str(directory), "root": str(ROOT), "cache": str(out),
+        "roster": "\n".join(roster), "playbooks": playbook_table(project),
         **{role: ", ".join(names) for role, names in by_role.items()},
     }
 
     _, team_md = load_doc(project, "team.md")
     parts = [team_md, f"## Your role: {agent['role']} ({agent['name']})\n\n{agent['body']}"]
 
-    skills = skill_lines(agent["skills"])
+    skills = skill_lines(agent["skills"]) + skill_lines(cfg.get("skills", {}))
     stack_parts = []
     for s in stacks:
         meta, body = load_doc(project, f"stacks/{s}.md")
@@ -207,11 +225,11 @@ def render(project, agent, agents, label, directory, stacks, context):
         parts.append("## Your skills\n\nLoad the matching skill before you start work it covers.\n\n"
                      + "\n".join(dict.fromkeys(skills)))
     parts += stack_parts
-    if context:
-        parts.append(f"## Project context\n\n{context.strip()}")
-
     text = "\n\n".join(parts)
     text = re.sub(r"\{\{(\w[\w-]*)\}\}", lambda m: values.get(m.group(1), NONE_IN_TEAM), text)
+    # Project context is the user's own text, so a literal {{...}} in it stays as is.
+    if cfg.get("context"):
+        text += f"\n\n## Project context\n\n{cfg['context'].strip()}"
     return text + "\n"
 
 
@@ -221,15 +239,18 @@ def cmd_list():
     for name, p in names_in(project, "teams").items():
         team = tomllib.loads(p.read_text(encoding="utf-8"))
         members = ", ".join(
-            a["role"] + (f" x{a['count']}" if a.get("count", 1) > 1 else "") for a in team.get("agents", []))
+            a["role"] + (f" x{a['count']}" if a.get("count", 1) > 1 else "") + (f" ({a['kind']})" if "kind" in a else "")
+            for a in team.get("agents", []))
         print(f"  {name:<14} {team.get('description', '')}  [{members}]")
-    for kind in ("roles", "stacks"):
+    for kind in ("roles", "playbooks", "stacks"):
         print(f"\n{kind.capitalize()}:")
         for name in names_in(project, kind):
             meta, _ = load_doc(project, f"{kind}/{name}.md")
             extra = f" ({meta['kind']})" if kind == "roles" and "kind" in meta else ""
+            if kind == "playbooks" and meta.get("kinds"):
+                extra = f" ({', '.join(meta['kinds'])})"
             if kind == "stacks" and meta.get("detect"):
-                extra = f"  [detect: {', '.join(meta['detect'])}; team: {meta.get('team', 'feature')}]"
+                extra = f"  [detect: {', '.join(meta['detect'])}; team: {meta.get('team', DEFAULT_TEAM)}]"
             print(f"  {name:<14} {meta.get('description', '')}{extra}")
 
 
@@ -262,12 +283,12 @@ def cmd_up(args):
     detected = stacks is None
     if detected:
         stacks = detect_stacks(directory)
-    # Team: flag, then project config, then the first stack that names one, then "feature".
+    # Team: flag, then project config, then the first stack that names one, then the default.
     team_name = args.team or cfg.get("team")
     for s in stacks:  # also validates every stack before anything is written
         stack_team = load_doc(directory, f"stacks/{s}.md")[0].get("team")
         team_name = team_name or stack_team
-    team_name = team_name or "feature"
+    team_name = team_name or DEFAULT_TEAM
     team = load_team(directory, team_name)
     prefix, agents = build_agents(directory, team, label)
 
@@ -276,7 +297,7 @@ def cmd_up(args):
     for a in agents:
         a["args"] = [render_settings(x, out) for x in a["args"]]
         a["prompt"] = out / f"{a['suffix']}.md"
-        a["text"] = render(directory, a, agents, label, directory, stacks, cfg.get("context", ""))
+        a["text"] = render(directory, a, agents, label, directory, stacks, cfg, out)
         a["prompt"].write_text(a["text"], encoding="utf-8")
 
     stack_note = (", ".join(stacks) or "none") + (" (detected)" if detected and stacks else "")
@@ -323,7 +344,7 @@ def main():
     p = argparse.ArgumentParser(prog="shepherd", description=__doc__.split("\n\n")[0])
     p.add_argument("dir", nargs="?", default=".", help="project directory (default: current)")
     p.add_argument("label", nargs="?", help="workspace name and agent-name prefix (default: folder name)")
-    p.add_argument("--team", help="team from teams/ (default: .shepherd.toml or 'feature')")
+    p.add_argument("--team", help=f"team from teams/ (default: .shepherd.toml or '{DEFAULT_TEAM}')")
     p.add_argument("--stack", action="append", help="stack from stacks/, repeatable")
     p.add_argument("--no-focus", action="store_true", help="do not switch to the new workspace")
     p.add_argument("--dry-run", action="store_true", help="only render the prompts and show the plan")

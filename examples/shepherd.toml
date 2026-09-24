@@ -1,7 +1,7 @@
 # Copy to <project>/.shepherd.toml. Every key is optional.
 
-# Team from teams/ (default: "feature").
-team = "feature"
+# Team from teams/ (default: "crew").
+team = "crew"
 
 # Stacks from stacks/ whose rules and skills every agent gets.
 stacks = ["web"]
@@ -13,3 +13,7 @@ stacks = ["web"]
 context = """
 Run tests with `npm test`. The staging database is shared; never reset it.
 """
+
+# Extra skills every agent gets, each with when to use it.
+# [skills]
+# "my-skill" = "when to load it"
