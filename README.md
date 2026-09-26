@@ -27,6 +27,7 @@ shepherd                            # default team (crew) in the current folder
 shepherd ~/coding/app               # team in another folder
 shepherd ~/coding/app api           # custom label: api-lead, api-worker-1, ...
 shepherd --team pair --stack web    # pick a team and stacks
+shepherd --3                        # lead + 3 workers: claude, codex, codex
 shepherd --dry-run                  # render prompts and show the plan, open nothing
 shepherd list                       # teams, roles, playbooks and stacks available here
 ```
@@ -36,6 +37,11 @@ shepherd list                       # teams, roles, playbooks and stacks availab
 | `crew` (default) | lead + `worker-1`, `worker-2` (Claude Code) + `worker-3`, `worker-4` (Codex) |
 | `pair` | lead + one Codex `worker`, for small changes |
 | `sf` | one Claude agent working through vibe-force (below) |
+
+`--N` (e.g. `--1`, `--3`, or `--workers 3`) replaces the team's workers with N workers
+whose kinds go claude, codex, codex, claude, codex, codex, ... So `--1` is lead + one
+Claude, `--3` is lead + one Claude + two Codex. The team's lead and its worker settings
+stay; a team without workers (e.g. `sf`) refuses `--N`.
 
 You talk to the lead. The lead agrees on the goal with you, plans the work, gives each
 worker a task with a role and a playbook, runs independent tasks in parallel, checks
@@ -225,8 +231,13 @@ hook allows.
 
 Each agent's prompt is `team.md` + its role + its skills + the stacks + the project
 context, rendered to `~/.cache/shepherd/<prefix>/<agent>.md`. Claude gets it through
-`--append-system-prompt-file`, Codex through `-c developer_instructions=...`. It is
-added to the agent's own setup (CLAUDE.md, AGENTS.md, memory), not a replacement.
+`--append-system-prompt-file`, Codex through a profile: `developer_instructions` in
+`$CODEX_HOME/shepherd-<agent>.config.toml` (default `~/.codex`), loaded with `-p` on top of
+your own config. It is added to the agent's own setup (CLAUDE.md, AGENTS.md, memory), not
+a replacement. Herdr types the start command into the shell, so it has to stay short.
+Codex workers start with `--no-daemon` (embedded mode; sessions are still saved and
+`codex resume` works) and `--approve-for-me`: they stay in the workspace-write sandbox,
+and what needs approval goes to Codex's automatic review instead of stopping for you.
 
 Placeholders in `team.md`, roles and stacks (the project context is left as written):
 
@@ -241,7 +252,9 @@ Placeholders in `team.md`, roles and stacks (the project context is left as writ
 
 Any other placeholder, e.g. a role not in the team, becomes "(none in this team)".
 
-The first agent in a team opens on the left, the rest are stacked evenly on the right.
+Agents open in two columns, filled top to bottom in team order: the first half on the
+left (lead at the top), the rest on the right. The default `crew` gives lead and
+`worker-1` on the left, `worker-2` to `worker-4` on the right.
 
 ## Extending
 

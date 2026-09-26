@@ -2,7 +2,7 @@
 """shepherd - open a Herdr workspace with a team of coding agents.
 
 Usage:
-  shepherd [dir] [label] [--team NAME] [--stack NAME]... [--no-focus] [--dry-run]
+  shepherd [dir] [label] [--team NAME] [--N] [--stack NAME]... [--no-focus] [--dry-run]
   shepherd list
 
 Teams, roles, playbooks and stacks live in this repo (teams/, roles/, playbooks/, stacks/). A project can
@@ -10,6 +10,7 @@ pick its defaults in <dir>/.shepherd.toml and override any file in <dir>/.shephe
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -23,17 +24,35 @@ CACHE = Path.home() / ".cache" / "shepherd"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # Herdr agent-name rule
 NONE_IN_TEAM = "(none in this team)"
 DEFAULT_TEAM = "crew"
-
-# How each agent kind receives its instructions. Herdr refuses multi-line
-# arguments, so Claude reads a file and Codex gets a one-line TOML string.
-KINDS = {
-    "claude": lambda path, text: ["--append-system-prompt-file", str(path)],
-    "codex": lambda path, text: ["-c", "developer_instructions=" + json.dumps(text, ensure_ascii=False)],
-}
+WORKER_KINDS = ["claude", "codex", "codex"]  # --N picks worker kinds in this order, repeating
 
 
 def die(msg):
     sys.exit(f"shepherd: {msg}")
+
+
+def codex_args(agent):
+    """Codex has no instructions-file flag, so the prompt goes into a profile that
+    `-p` layers over the user's config. Herdr types the command into the shell, and
+    a few KB of inline `-c` text could lose its Enter while the shell was starting."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    home.mkdir(parents=True, exist_ok=True)
+    profile = f"shepherd-{agent['name']}"
+    toml = "developer_instructions = " + json.dumps(agent["text"].strip(), ensure_ascii=False) + "\n"
+    (home / f"{profile}.config.toml").write_text(toml, encoding="utf-8")
+    # Embedded mode (--no-daemon) is the tested path; the shared background server
+    # rejects -c and is untested with profiles. --approve-for-me keeps the
+    # workspace-write sandbox but sends approval requests to automatic review
+    # instead of the user, so workers do not stop on every command.
+    return ["--no-daemon", "--approve-for-me", "-p", profile]
+
+
+# How each agent kind receives its instructions. Herdr refuses multi-line
+# arguments, so every kind gets a short command that points at a file.
+KINDS = {
+    "claude": lambda agent: ["--append-system-prompt-file", str(agent["prompt"])],
+    "codex": codex_args,
+}
 
 
 def search_paths(project):
@@ -65,6 +84,19 @@ def load_team(project, name):
     if not p:
         die(f"unknown team '{name}' (see: shepherd list)")
     return tomllib.loads(p.read_text(encoding="utf-8"))
+
+
+def with_workers(team, count):
+    """The team with its workers replaced by `count` workers whose kinds follow
+    WORKER_KINDS. The first worker entry supplies the rest (args, skills)."""
+    specs = team.get("agents", [])
+    template = next((s for s in specs if s["role"] == "worker"), None)
+    if not template:
+        die("--N needs a team with workers; this one has none")
+    if count < 1:
+        die("--N needs at least one worker")
+    workers = [{**template, "kind": WORKER_KINDS[i % len(WORKER_KINDS)], "count": 1} for i in range(count)]
+    return {**team, "agents": [s for s in specs if s["role"] != "worker"] + workers}
 
 
 def names_in(project, kind):
@@ -254,21 +286,26 @@ def cmd_list():
             print(f"  {name:<14} {meta.get('description', '')}{extra}")
 
 
-def layout(root_pane, count, directory):
-    """First agent on the left, the rest stacked evenly on the right."""
-    panes = [root_pane]
-    if count == 1:
-        return panes
-    right = herdr_ok("pane", "split", root_pane, "--direction", "right", "--cwd", str(directory),
-                     "--no-focus")["pane"]["pane_id"]
-    panes.append(right)
-    rest = count - 1
-    for i in range(rest - 1):
+def stack(top, rows, directory):
+    """Split `top` into `rows` equal panes, top to bottom."""
+    panes = [top]
+    for i in range(rows - 1):
         # The split pane keeps `ratio` of its space, so 1/remaining gives equal rows.
         new = herdr_ok("pane", "split", panes[-1], "--direction", "down", "--ratio",
-                       f"{1 / (rest - i):.4f}", "--cwd", str(directory), "--no-focus")["pane"]["pane_id"]
+                       f"{1 / (rows - i):.4f}", "--cwd", str(directory), "--no-focus")["pane"]["pane_id"]
         panes.append(new)
     return panes
+
+
+def layout(root_pane, count, directory):
+    """Two columns, filled top to bottom: the first half of the agents on the left
+    (lead first), the rest on the right, e.g. 2 + 3 for a team of five."""
+    if count == 1:
+        return [root_pane]
+    right = herdr_ok("pane", "split", root_pane, "--direction", "right", "--cwd", str(directory),
+                     "--no-focus")["pane"]["pane_id"]
+    left_rows = count // 2
+    return stack(root_pane, left_rows, directory) + stack(right, count - left_rows, directory)
 
 
 def cmd_up(args):
@@ -290,6 +327,8 @@ def cmd_up(args):
         team_name = team_name or stack_team
     team_name = team_name or DEFAULT_TEAM
     team = load_team(directory, team_name)
+    if args.workers is not None:
+        team = with_workers(team, args.workers)
     prefix, agents = build_agents(directory, team, label)
 
     out = CACHE / prefix
@@ -319,7 +358,7 @@ def cmd_up(args):
 
     def start(pair):
         a, pane = pair
-        extra = KINDS[a["kind"]](a["prompt"], a["text"].strip()) + a["args"]
+        extra = KINDS[a["kind"]](a) + a["args"]
         return a, herdr("agent", "start", a["name"], "--kind", a["kind"], "--pane", pane, "--", *extra)
 
     failed = False
@@ -345,10 +384,14 @@ def main():
     p.add_argument("dir", nargs="?", default=".", help="project directory (default: current)")
     p.add_argument("label", nargs="?", help="workspace name and agent-name prefix (default: folder name)")
     p.add_argument("--team", help=f"team from teams/ (default: .shepherd.toml or '{DEFAULT_TEAM}')")
+    p.add_argument("--workers", type=int, metavar="N",
+                   help="lead + N workers: claude, codex, codex, repeating (short: --N, e.g. --3)")
     p.add_argument("--stack", action="append", help="stack from stacks/, repeatable")
     p.add_argument("--no-focus", action="store_true", help="do not switch to the new workspace")
     p.add_argument("--dry-run", action="store_true", help="only render the prompts and show the plan")
-    cmd_up(p.parse_args())
+    # --3 is short for --workers 3
+    argv = [x for a in sys.argv[1:] for x in (["--workers", a[2:]] if re.fullmatch(r"--\d+", a) else [a])]
+    cmd_up(p.parse_args(argv))
 
 
 if __name__ == "__main__":

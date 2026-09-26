@@ -13,7 +13,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -130,6 +132,44 @@ class BuildAgentsTest(TempProject):
         self.assertIn("shepherd:dispatch", agents[0]["skills"])
 
 
+class KindsTest(unittest.TestCase):
+    def test_codex_gets_a_short_command_and_a_profile_with_the_prompt(self):
+        with tempfile.TemporaryDirectory() as home, \
+                unittest.mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+            text = 'line "one"\nline two \u0105 \\ end\n'
+            args = sh.KINDS["codex"]({"name": "proj-worker-3", "text": text})
+            self.assertEqual(args, ["--no-daemon", "--approve-for-me", "-p", "shepherd-proj-worker-3"])
+            profile = Path(home) / "shepherd-proj-worker-3.config.toml"
+            data = tomllib.loads(profile.read_text(encoding="utf-8"))
+            self.assertEqual(data, {"developer_instructions": text.strip()})
+
+
+class LayoutTest(unittest.TestCase):
+    def layout(self, count):
+        splits = []
+
+        def fake_herdr_ok(*args):
+            pane, direction = args[2], args[args.index("--direction") + 1]
+            new = f"p{len(splits) + 1}"
+            splits.append((pane, direction, new))
+            return {"pane": {"pane_id": new}}
+
+        with unittest.mock.patch.object(sh, "herdr_ok", fake_herdr_ok):
+            return sh.layout("p0", count, Path("/tmp")), splits
+
+    def test_five_agents_give_two_left_and_three_right(self):
+        panes, splits = self.layout(5)
+        # p0 lead, p2 worker-1 under it; p1 right column top, p3 and p4 under it.
+        self.assertEqual(panes, ["p0", "p2", "p1", "p3", "p4"])
+        self.assertEqual(splits, [("p0", "right", "p1"), ("p0", "down", "p2"),
+                                  ("p1", "down", "p3"), ("p3", "down", "p4")])
+
+    def test_small_teams(self):
+        self.assertEqual(self.layout(1), (["p0"], []))
+        self.assertEqual(self.layout(2)[0], ["p0", "p1"])
+        self.assertEqual(self.layout(3)[0], ["p0", "p1", "p2"])  # lead alone on the left
+
+
 class PlaybookTableTest(TempProject):
     def test_repo_playbooks_listed_with_absolute_paths(self):
         table = sh.playbook_table(self.project)
@@ -170,6 +210,20 @@ class DryRunTest(TempProject):
             self.assertIn(f"proj-{suffix}", r.stdout)
         self.assertRegex(r.stdout, r"proj-worker-3\s+codex")
         self.assertRegex(r.stdout, r"proj-worker-2\s+claude")
+
+    def test_worker_count_flag_follows_kind_order(self):
+        r = self.dry_run("--5")
+        kinds = re.findall(r"proj-(\S+)\s+(\w+)", r.stdout)
+        self.assertEqual(kinds, [("lead", "claude"), ("worker-1", "claude"), ("worker-2", "codex"),
+                                 ("worker-3", "codex"), ("worker-4", "claude"), ("worker-5", "codex")])
+        r = self.dry_run("--workers", "1")
+        self.assertEqual(re.findall(r"proj-(\S+)\s+(\w+)", r.stdout), [("lead", "claude"), ("worker", "claude")])
+
+    def test_worker_count_flag_refuses_team_without_workers(self):
+        write(self.project / ".shepherd" / "teams" / "solo.toml", '[[agents]]\nrole = "lead"\n')
+        r = self.run_cli("--dry-run", "--team", "solo", "--2", str(self.project))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("needs a team with workers", r.stderr)
 
     def test_lead_prompt_has_every_playbook_and_no_placeholders(self):
         self.dry_run()
